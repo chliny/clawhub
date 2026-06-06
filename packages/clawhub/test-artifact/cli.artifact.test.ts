@@ -54,6 +54,24 @@ describe("built CLI artifact", () => {
     expect(result.stdout).toContain("ClawHub CLI");
   });
 
+  it("prints help by default", async () => {
+    const result = runNode([binPath]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("Usage: clawhub");
+    expect(result.stdout).toContain("sync");
+  });
+
+  it("exposes sync help for reusable publishing workflows", async () => {
+    const result = runNode([binPath, "sync", "--help"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout).toContain("Usage: clawhub sync");
+    expect(result.stdout).toContain("Scan local skills and publish new/updated ones");
+  });
+
   it("reports unknown top-level commands clearly", async () => {
     const result = runNode([binPath, "nope"]);
 

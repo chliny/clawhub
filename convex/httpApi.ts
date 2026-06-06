@@ -1,6 +1,7 @@
 import {
   ApiCliSkillDeleteResponseSchema,
   ApiCliTelemetrySyncResponseSchema,
+  CliTelemetryInstallRequestSchema,
   CliPublishRequestSchema,
   CliSkillDeleteRequestSchema,
   CliTelemetrySyncRequestSchema,
@@ -237,17 +238,19 @@ async function cliTelemetryInstallHandler(ctx: ActionCtx, request: Request) {
 
   try {
     const { userId } = await requireApiTokenUser(ctx, request);
-    const args = parseArk(CliTelemetrySyncRequestSchema, body, "Telemetry payload");
-    await ctx.runMutation(internal.telemetry.reportCliSyncInternal, {
+    if (isLegacyCliTelemetrySyncPayload(body)) {
+      await reportCliSyncTelemetry(ctx, userId, body);
+      const ok = parseArk(ApiCliTelemetrySyncResponseSchema, { ok: true }, "Telemetry response");
+      return json(ok);
+    }
+
+    const args = parseArk(CliTelemetryInstallRequestSchema, body, "Install telemetry payload");
+    await ctx.runMutation(internal.telemetry.reportCliInstallInternal, {
       userId,
-      roots: args.roots.map((root) => ({
-        rootId: root.rootId,
-        label: root.label,
-        skills: root.skills.map((skill) => ({
-          slug: skill.slug,
-          version: skill.version ?? undefined,
-        })),
-      })),
+      slug: args.slug,
+      version: args.version,
+      rootId: args.rootId,
+      rootLabel: args.rootLabel,
     });
     const ok = parseArk(ApiCliTelemetrySyncResponseSchema, { ok: true }, "Telemetry response");
     return json(ok);
@@ -258,9 +261,47 @@ async function cliTelemetryInstallHandler(ctx: ActionCtx, request: Request) {
   }
 }
 
-const cliTelemetrySyncHandler = cliTelemetryInstallHandler;
+function isLegacyCliTelemetrySyncPayload(body: unknown) {
+  return body !== null && typeof body === "object" && "roots" in body && !("event" in body);
+}
+
+async function reportCliSyncTelemetry(ctx: ActionCtx, userId: Id<"users">, body: unknown) {
+  const args = parseArk(CliTelemetrySyncRequestSchema, body, "Telemetry payload");
+  await ctx.runMutation(internal.telemetry.reportCliSyncInternal, {
+    userId,
+    roots: args.roots.map((root) => ({
+      rootId: root.rootId,
+      label: root.label,
+      skills: root.skills.map((skill) => ({
+        slug: skill.slug,
+        version: skill.version ?? undefined,
+      })),
+    })),
+  });
+}
+
+async function cliTelemetrySyncHandler(ctx: ActionCtx, request: Request) {
+  let body: unknown;
+  try {
+    body = await request.json();
+  } catch {
+    return text("Invalid JSON", 400);
+  }
+
+  try {
+    const { userId } = await requireApiTokenUser(ctx, request);
+    await reportCliSyncTelemetry(ctx, userId, body);
+    const ok = parseArk(ApiCliTelemetrySyncResponseSchema, { ok: true }, "Telemetry response");
+    return json(ok);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Telemetry failed";
+    if (message.toLowerCase().includes("unauthorized")) return text(formatAuthFailure(error), 401);
+    return text(message, 400);
+  }
+}
+
 export const cliTelemetryInstallHttp = httpAction(cliTelemetryInstallHandler);
-export const cliTelemetrySyncHttp = httpAction(cliTelemetryInstallHandler);
+export const cliTelemetrySyncHttp = httpAction(cliTelemetrySyncHandler);
 
 async function cliDeviceCodeHandler(ctx: ActionCtx, request: Request) {
   if (request.method !== "POST") return text("Method not allowed", 405);

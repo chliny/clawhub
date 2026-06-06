@@ -137,6 +137,13 @@ export const CliTelemetrySyncRequestSchema = type({
         }).array(),
     }).array(),
 });
+export const CliTelemetryInstallRequestSchema = type({
+    event: '"install"',
+    slug: "string",
+    version: "string?",
+    rootId: "string?",
+    rootLabel: "string?",
+});
 export const ApiCliTelemetrySyncResponseSchema = type({
     ok: "true",
 });

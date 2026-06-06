@@ -51,6 +51,67 @@ export const reportCliSyncInternal = internalMutation({
   },
 });
 
+export const reportCliInstallInternal = internalMutation({
+  args: {
+    userId: v.id("users"),
+    slug: v.string(),
+    version: v.optional(v.string()),
+    rootId: v.optional(v.string()),
+    rootLabel: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const slug = args.slug.trim().toLowerCase();
+    if (!slug) return;
+
+    const skill = await ctx.db
+      .query("skills")
+      .withIndex("by_slug", (q) => q.eq("slug", slug))
+      .unique();
+    if (!skill || skill.softDeletedAt) return;
+
+    const now = Date.now();
+    const rootId = args.rootId?.trim();
+    if (rootId) {
+      await upsertSingleRootInstall(ctx, {
+        userId: args.userId,
+        skillId: skill._id,
+        rootId,
+        label: args.rootLabel?.trim() || "Unknown",
+        now,
+        version: args.version,
+      });
+      return;
+    }
+
+    const existing = await ctx.db
+      .query("userSkillInstalls")
+      .withIndex("by_user_skill", (q) => q.eq("userId", args.userId).eq("skillId", skill._id))
+      .unique();
+    if (existing) {
+      const wasInactive = existing.activeRoots <= 0;
+      await ctx.db.patch(existing._id, {
+        lastSeenAt: now,
+        activeRoots: Math.max(1, existing.activeRoots),
+        lastVersion: args.version,
+      });
+      if (wasInactive) {
+        await insertStatEvent(ctx, { skillId: skill._id, kind: "install_reactivate" });
+      }
+      return;
+    }
+
+    await ctx.db.insert("userSkillInstalls", {
+      userId: args.userId,
+      skillId: skill._id,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      activeRoots: 1,
+      lastVersion: args.version,
+    });
+    await insertStatEvent(ctx, { skillId: skill._id, kind: "install_new" });
+  },
+});
+
 export const clearMyTelemetry = mutation({
   args: {},
   handler: async (ctx) => {
@@ -219,6 +280,65 @@ function normalizeRoots(roots: RootPayload[]): RootPayload[] {
     });
   }
   return unique;
+}
+
+async function upsertSingleRootInstall(
+  ctx: MutationCtx,
+  params: {
+    userId: Id<"users">;
+    skillId: Id<"skills">;
+    rootId: string;
+    label: string;
+    now: number;
+    version?: string;
+  },
+) {
+  await upsertRoot(ctx, {
+    userId: params.userId,
+    rootId: params.rootId,
+    label: params.label,
+    now: params.now,
+  });
+
+  const existing = await ctx.db
+    .query("userSkillRootInstalls")
+    .withIndex("by_user_root_skill", (q) =>
+      q.eq("userId", params.userId).eq("rootId", params.rootId).eq("skillId", params.skillId),
+    )
+    .unique();
+
+  if (existing) {
+    const wasRemoved = Boolean(existing.removedAt);
+    await ctx.db.patch(existing._id, {
+      lastSeenAt: params.now,
+      lastVersion: params.version ?? existing.lastVersion,
+      removedAt: undefined,
+    });
+    if (wasRemoved) {
+      await incrementActiveRoots(ctx, {
+        userId: params.userId,
+        skillId: params.skillId,
+        now: params.now,
+        version: params.version,
+      });
+    }
+    return;
+  }
+
+  await ctx.db.insert("userSkillRootInstalls", {
+    userId: params.userId,
+    rootId: params.rootId,
+    skillId: params.skillId,
+    firstSeenAt: params.now,
+    lastSeenAt: params.now,
+    lastVersion: params.version,
+  });
+  await incrementActiveRoots(ctx, {
+    userId: params.userId,
+    skillId: params.skillId,
+    now: params.now,
+    version: params.version,
+  });
 }
 
 async function upsertRoot(

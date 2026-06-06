@@ -165,6 +165,15 @@ export const CliTelemetrySyncRequestSchema = type({
 });
 export type CliTelemetrySyncRequest = (typeof CliTelemetrySyncRequestSchema)[inferred];
 
+export const CliTelemetryInstallRequestSchema = type({
+  event: '"install"',
+  slug: "string",
+  version: "string?",
+  rootId: "string?",
+  rootLabel: "string?",
+});
+export type CliTelemetryInstallRequest = (typeof CliTelemetryInstallRequestSchema)[inferred];
+
 export const ApiCliTelemetrySyncResponseSchema = type({
   ok: "true",
 });

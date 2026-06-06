@@ -56,7 +56,6 @@ import { configureCommanderHelp, styleEnvBlock, styleTitle } from "./cli/helpSty
 import { DEFAULT_REGISTRY, DEFAULT_SITE } from "./cli/registry.js";
 import type { GlobalOpts } from "./cli/types.js";
 import { fail } from "./cli/ui.js";
-import { readGlobalConfig } from "./config.js";
 
 const program = new Command()
   .name("clawhub")
@@ -775,18 +774,18 @@ registerCommand(program, ["sync"])
   .option("--bump <type>", "Version bump for updates (patch|minor|major)", "patch")
   .option("--changelog <text>", "Changelog to use for updates (non-interactive)")
   .option("--tags <tags>", "Comma-separated tags", "latest")
-  .option("--concurrency <n>", "Concurrent registry checks (default: 4)", "4")
-  .option("--no-clawdbot-roots", "Only scan the configured workdir/dir and --root values")
-  .option("--source-repo <repo>", "GitHub repo (owner/repo or URL)")
-  .option("--source-commit <sha>", "Git commit SHA")
-  .option("--source-ref <ref>", "Git ref/tag/branch")
+  .option("--concurrency <n>", "Concurrent registry/file checks", (value) =>
+    Number.parseInt(value, 10),
+  )
+  .option("--source-repo <repo>", "GitHub repo URL or owner/name for source provenance")
+  .option("--source-commit <sha>", "Git commit SHA for source provenance")
+  .option("--source-ref <ref>", "Git ref for source provenance")
+  .addOption(
+    new Option("--clawdbot-roots", "Include Clawdbot-configured roots").default(true, "enabled"),
+  )
+  .addOption(new Option("--no-clawdbot-roots", "Disable Clawdbot-configured roots"))
   .action(async (options) => {
     const opts = await resolveGlobalOpts();
-    const bump = String(options.bump ?? "patch") as "patch" | "minor" | "major";
-    if (!["patch", "minor", "major"].includes(bump)) fail("--bump must be patch|minor|major");
-    const concurrencyRaw = Number(options.concurrency ?? 4);
-    const concurrency = Number.isFinite(concurrencyRaw) ? Math.round(concurrencyRaw) : 4;
-    if (concurrency < 1 || concurrency > 32) fail("--concurrency must be between 1 and 32");
     await cmdSync(
       opts,
       {
@@ -795,10 +794,10 @@ registerCommand(program, ["sync"])
         dryRun: options.dryRun,
         json: options.json,
         owner: options.owner,
-        bump,
+        bump: options.bump,
         changelog: options.changelog,
         tags: options.tags,
-        concurrency,
+        concurrency: options.concurrency,
         clawdbotRoots: options.clawdbotRoots,
         sourceRepo: options.sourceRepo,
         sourceCommit: options.sourceCommit,
@@ -808,13 +807,7 @@ registerCommand(program, ["sync"])
     );
   });
 
-program.action(async () => {
-  const opts = await resolveGlobalOpts();
-  const cfg = await readGlobalConfig();
-  if (cfg?.token) {
-    await cmdSync(opts, {}, isInputAllowed());
-    return;
-  }
+program.action(() => {
   program.outputHelp();
   process.exitCode = 0;
 });

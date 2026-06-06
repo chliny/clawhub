@@ -135,6 +135,7 @@ type TemporalPublisherAggregate = {
 const temporalScoreValidator = v.object({
   spike: v.boolean(),
   sustained: v.boolean(),
+  nearConversion: v.boolean(),
   pressure: v.number(),
   recent7Downloads: v.number(),
   recent7Installs: v.number(),
@@ -144,10 +145,16 @@ const temporalScoreValidator = v.object({
   recent30Downloads: v.number(),
   recent30Installs: v.number(),
   downloadInstallRatio30: v.number(),
+  installDownloadRatio7: v.number(),
+  installDownloadRatio30: v.number(),
+  installDownloadExcessZScore7: v.number(),
+  installDownloadExcessZScore30: v.number(),
   spikeWindowStartDay: v.optional(v.number()),
   spikeWindowEndDay: v.optional(v.number()),
   sustainedWindowStartDay: v.optional(v.number()),
   sustainedWindowEndDay: v.optional(v.number()),
+  nearConversionWindowStartDay: v.optional(v.number()),
+  nearConversionWindowEndDay: v.optional(v.number()),
   reasonCodes: v.array(v.string()),
 });
 
@@ -807,7 +814,9 @@ export async function collectTemporalPublisherAbuseSkillCandidatesPageInternalHa
       args.mode === "backfill"
         ? computeHistoricalSkillTemporalAbuseScore({ dailyStats })
         : computeCurrentSkillTemporalAbuseScore({ todayDay, dailyStats });
-    if (!temporalScore.spike && !temporalScore.sustained) continue;
+    if (!temporalScore.spike && !temporalScore.sustained && !temporalScore.nearConversion) {
+      continue;
+    }
 
     const publisher = await ctx.db.get(skill.ownerPublisherId);
     if (!publisher || (await isPublisherExcludedFromPublisherAbuse(ctx, publisher))) continue;
@@ -1209,6 +1218,7 @@ function temporalEvidenceFromCandidate(candidate: TemporalSkillCandidate) {
     displayName: candidate.displayName,
     spike: candidate.temporalScore.spike,
     sustained: candidate.temporalScore.sustained,
+    nearConversion: candidate.temporalScore.nearConversion,
     pressure: candidate.temporalScore.pressure,
     recent7Downloads: candidate.temporalScore.recent7Downloads,
     recent7Installs: candidate.temporalScore.recent7Installs,
@@ -1218,10 +1228,16 @@ function temporalEvidenceFromCandidate(candidate: TemporalSkillCandidate) {
     recent30Downloads: candidate.temporalScore.recent30Downloads,
     recent30Installs: candidate.temporalScore.recent30Installs,
     downloadInstallRatio30: candidate.temporalScore.downloadInstallRatio30,
+    installDownloadRatio7: candidate.temporalScore.installDownloadRatio7,
+    installDownloadRatio30: candidate.temporalScore.installDownloadRatio30,
+    installDownloadExcessZScore7: candidate.temporalScore.installDownloadExcessZScore7,
+    installDownloadExcessZScore30: candidate.temporalScore.installDownloadExcessZScore30,
     spikeWindowStartDay: candidate.temporalScore.spikeWindowStartDay,
     spikeWindowEndDay: candidate.temporalScore.spikeWindowEndDay,
     sustainedWindowStartDay: candidate.temporalScore.sustainedWindowStartDay,
     sustainedWindowEndDay: candidate.temporalScore.sustainedWindowEndDay,
+    nearConversionWindowStartDay: candidate.temporalScore.nearConversionWindowStartDay,
+    nearConversionWindowEndDay: candidate.temporalScore.nearConversionWindowEndDay,
     reasonCodes: candidate.temporalScore.reasonCodes,
   };
 }

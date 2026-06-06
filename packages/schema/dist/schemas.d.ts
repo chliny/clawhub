@@ -160,6 +160,14 @@ export declare const CliTelemetrySyncRequestSchema: import("arktype/internal/var
     }[];
 }, {}>;
 export type CliTelemetrySyncRequest = (typeof CliTelemetrySyncRequestSchema)[inferred];
+export declare const CliTelemetryInstallRequestSchema: import("arktype/internal/variants/object.ts").ObjectType<{
+    event: "install";
+    slug: string;
+    version?: string | undefined;
+    rootId?: string | undefined;
+    rootLabel?: string | undefined;
+}, {}>;
+export type CliTelemetryInstallRequest = (typeof CliTelemetryInstallRequestSchema)[inferred];
 export declare const ApiCliTelemetrySyncResponseSchema: import("arktype/internal/variants/object.ts").ObjectType<{
     ok: true;
 }, {}>;

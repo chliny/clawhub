@@ -267,7 +267,35 @@ describe("httpApi handlers", () => {
     expect(json.user.handle).toBe("p");
   });
 
-  it("cliTelemetryInstallHttp forwards roots and returns ok", async () => {
+  it("cliTelemetryInstallHttp forwards one install event and returns ok", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValueOnce({ userId: "users:1" } as never);
+    const runMutation = vi.fn().mockResolvedValue(null);
+    const response = await __handlers.cliTelemetryInstallHandler(
+      makeCtx({ runMutation }),
+      new Request("https://x/api/cli/telemetry/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          event: "install",
+          slug: "weather",
+          version: "1.0.0",
+          rootId: "abc",
+          rootLabel: "~/skills",
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(runMutation).toHaveBeenCalledWith(expect.anything(), {
+      userId: "users:1",
+      slug: "weather",
+      version: "1.0.0",
+      rootId: "abc",
+      rootLabel: "~/skills",
+    });
+  });
+
+  it("cliTelemetryInstallHttp keeps accepting legacy sync snapshots", async () => {
     vi.mocked(requireApiTokenUser).mockResolvedValueOnce({ userId: "users:1" } as never);
     const runMutation = vi.fn().mockResolvedValue(null);
     const response = await __handlers.cliTelemetryInstallHandler(
@@ -280,15 +308,21 @@ describe("httpApi handlers", () => {
             {
               rootId: "abc",
               label: "~/skills",
-              skills: [{ slug: "weather", version: null }],
+              skills: [{ slug: "weather", version: "1.0.0" }],
             },
           ],
         }),
       }),
     );
+
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: true });
-    expect(runMutation).toHaveBeenCalledTimes(1);
+    expect(runMutation).toHaveBeenCalledWith(expect.anything(), {
+      userId: "users:1",
+      roots: [
+        { rootId: "abc", label: "~/skills", skills: [{ slug: "weather", version: "1.0.0" }] },
+      ],
+    });
   });
 
   it("cliTelemetrySyncHttp remains a backwards-compatible alias", async () => {

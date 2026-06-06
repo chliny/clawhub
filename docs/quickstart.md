@@ -116,10 +116,19 @@ fields, source attribution, and upload plan without publishing.
 Code plugins must include OpenClaw compatibility metadata in `package.json`,
 including `openclaw.compat.pluginApi` and `openclaw.build.openclawVersion`.
 
-## Sync skills you maintain
+## Publish a skill catalog
 
-`sync` scans skill folders and publishes new or changed skills that are not
-already synchronized.
+For one skill, publish the folder directly with `clawhub skill publish`.
+
+```bash
+clawhub skill publish ./my-skill \
+  --slug my-skill \
+  --name "My Skill" \
+  --version 1.0.0
+```
+
+For a local catalog, use `sync` to scan skill folders and publish new or changed
+skills.
 
 ```bash
 clawhub sync --all --dry-run
@@ -127,7 +136,8 @@ clawhub sync --all
 ```
 
 For catalog repos, ClawHub also provides a reusable GitHub workflow. By
-default it scans `skills/`; pass `skill_path` to process one folder.
+default it scans `skills/`; pass `skill_path` to process one folder. Use
+`dry_run: true` to preview the plan before publishing from CI.
 
 ```yaml
 jobs:
@@ -137,10 +147,6 @@ jobs:
       owner: nvidia
       dry_run: true
 ```
-
-When you are signed in, `sync` may also send a minimal install snapshot for
-aggregate install counts. See [Telemetry](./telemetry.md) for what is reported
-and how to opt out.
 
 ## Inspect before installing
 
