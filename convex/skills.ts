@@ -64,6 +64,12 @@ import {
   verdictFromCodes,
 } from "./lib/moderationReasonCodes";
 import {
+  createOfficialPublisherLookupCache,
+  isOfficialPublisher,
+  type OfficialPublisherLookupCache,
+  toPublicPublisherWithOfficial,
+} from "./lib/officialPublishers";
+import {
   type HydratableSkill,
   type PublicPublisher,
   toPublicPublisher,
@@ -1841,6 +1847,7 @@ async function buildPublicSkillEntries(
   },
 ) {
   const includeVersion = opts?.includeVersion ?? true;
+  const officialPublisherCache = createOfficialPublisherLookupCache();
   const ownerInfoCache = new Map<
     string,
     Promise<{
@@ -1866,8 +1873,12 @@ async function buildPublicSkillEntries(
     const ownerPromise = getOwnerPublisher(ctx, {
       ownerPublisherId,
       ownerUserId,
-    }).then((ownerDoc) => {
-      const publicOwner = toPublicPublisher(ownerDoc);
+    }).then(async (ownerDoc) => {
+      const publicOwner = await toPublicPublisherWithOfficial(
+        ctx,
+        ownerDoc,
+        officialPublisherCache,
+      );
       if (!publicOwner) {
         return { ownerHandle: null, owner: null };
       }
@@ -2301,7 +2312,7 @@ export const getBySlug = query({
     const latestVersion = toPublicSkillVersion(publicLatestVersionDoc);
     const generatedSkillCard = await getGeneratedSkillCardPublicFile(ctx, publicLatestVersionDoc);
     if (latestVersion) latestVersion.generatedSkillCard = generatedSkillCard;
-    const owner = toPublicPublisher(ownerPublisher);
+    const owner = await toPublicPublisherWithOfficial(ctx, ownerPublisher);
     if (!owner) return null;
     const badges = await getSkillBadgeMap(ctx, skill._id);
 
@@ -2640,7 +2651,7 @@ export const getBySlugForStaff = query({
       ownerPublisherId: skill.ownerPublisherId,
       ownerUserId: skill.ownerUserId,
     });
-    const owner = toPublicPublisher(ownerPublisher);
+    const owner = await toPublicPublisherWithOfficial(ctx, ownerPublisher);
     const badges = await getSkillBadgeMap(ctx, skill._id);
     const rawAuditLogs = await ctx.db
       .query("auditLogs")
@@ -4856,6 +4867,7 @@ export const listPublicPageV4 = query({
       Boolean(categorySlug) ||
       categoryKeywords.length > 0 ||
       excludeCategoryKeywords.length > 0;
+    const officialPublisherCache = createOfficialPublisherLookupCache();
 
     if (!hasDigestFilters) {
       const result = await getPage(ctx, {
@@ -4872,7 +4884,7 @@ export const listPublicPageV4 = query({
 
       const items: PublicSkillEntry[] = [];
       for (const digest of result.page) {
-        const item = await buildPublicSkillEntryFromDigest(ctx, digest);
+        const item = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
         if (item) items.push(item);
       }
       let nextCursor: string | null = null;
@@ -4925,7 +4937,7 @@ export const listPublicPageV4 = query({
             excludeCategoryKeywords,
           })
         ) {
-          const item = await buildPublicSkillEntryFromDigest(ctx, digest);
+          const item = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
           if (item) items.push(item);
         }
         if (items.length >= numItems) {
@@ -5118,6 +5130,7 @@ export const listRelatedByCategory = query({
       .order("desc")
       .take(scanLimit);
 
+    const officialPublisherCache = createOfficialPublisherLookupCache();
     const items: PublicSkillEntry[] = [];
     for (const digest of digests) {
       if (digest.skillId === args.skillId) continue;
@@ -5125,7 +5138,7 @@ export const listRelatedByCategory = query({
       if (isSkillSuspicious(hydratable)) continue;
       if (categorySlug && inferDigestSkillCategorySlug(digest) !== categorySlug) continue;
       if (!digestMatchesRelatedCategory(digest, keywords)) continue;
-      const item = await buildPublicSkillEntryFromDigest(ctx, digest);
+      const item = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
       if (!item) continue;
       items.push(item);
       if (items.length >= limit) break;
@@ -5153,6 +5166,7 @@ export const listPublicTrendingPage = query({
 
     if (!leaderboard) return { items: [], nextCursor: null };
 
+    const officialPublisherCache = createOfficialPublisherLookupCache();
     const items: PublicSkillEntry[] = [];
     for (const entry of leaderboard.items) {
       const digest = await ctx.db
@@ -5161,7 +5175,7 @@ export const listPublicTrendingPage = query({
         .unique();
       if (!digest) continue;
       if (args.nonSuspiciousOnly && digest.isSuspicious) continue;
-      const item = await buildPublicSkillEntryFromDigest(ctx, digest);
+      const item = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
       if (!item) continue;
       items.push(item);
       if (items.length >= limit) break;
@@ -5177,6 +5191,7 @@ export const listAuditPage = query({
   },
   handler: async (ctx, args) => {
     const { numItems, cursor } = normalizePublicListPagination(args.paginationOpts);
+    const officialPublisherCache = createOfficialPublisherLookupCache();
     const result = await ctx.db
       .query("skillSearchDigest")
       .withIndex("by_active_stats_downloads", (q) => q.eq("softDeletedAt", undefined))
@@ -5185,7 +5200,7 @@ export const listAuditPage = query({
 
     const page = [];
     for (const digest of result.page) {
-      const entry = await buildPublicSkillEntryFromDigest(ctx, digest);
+      const entry = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
       if (!entry) continue;
       const latestVersion = await loadPublicLatestVersionForDigest(ctx, digest);
       page.push({
@@ -5230,6 +5245,7 @@ export const listAuditPage = query({
 async function buildPublicSkillEntryFromDigest(
   ctx: Pick<QueryCtx, "db">,
   digest: Doc<"skillSearchDigest">,
+  officialPublisherCache?: OfficialPublisherLookupCache,
 ): Promise<PublicSkillEntry | null> {
   const hydratable = digestToHydratableSkill(digest);
   const publicSkill = toPublicSkill(hydratable);
@@ -5237,11 +5253,24 @@ async function buildPublicSkillEntryFromDigest(
   const ownerInfo = digestToOwnerInfo(digest);
   if (!ownerInfo?.owner) return null;
   const latestVersion = await resolveDigestLatestVersionForSkill(ctx, digest);
+  const owner =
+    digest.ownerPublisherId &&
+    (await isOfficialPublisher(
+      ctx,
+      {
+        _id: digest.ownerPublisherId,
+        deletedAt: undefined,
+        deactivatedAt: undefined,
+      },
+      officialPublisherCache,
+    ))
+      ? { ...ownerInfo.owner, official: true }
+      : ownerInfo.owner;
   return {
     skill: publicSkill,
     latestVersion,
     ownerHandle: ownerInfo.ownerHandle,
-    owner: ownerInfo.owner,
+    owner,
   };
 }
 
@@ -5976,9 +6005,10 @@ async function fetchHighlightedPage(
 
   const trimmed = digests.slice(0, opts.numItems);
 
+  const officialPublisherCache = createOfficialPublisherLookupCache();
   const items: PublicSkillEntry[] = [];
   for (const digest of trimmed) {
-    const item = await buildPublicSkillEntryFromDigest(ctx, digest);
+    const item = await buildPublicSkillEntryFromDigest(ctx, digest, officialPublisherCache);
     if (item) items.push(item);
   }
 

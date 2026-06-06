@@ -81,6 +81,7 @@ type SearchSkillEntry = {
     handle?: string | null;
     displayName?: string | null;
     image?: string | null;
+    official?: boolean | null;
   } | null;
 };
 
@@ -180,7 +181,13 @@ type GetBySlugResult = {
     latestVersionId?: Id<"skillVersions">;
   } | null;
   latestVersion: PublicSkillVersionResponse | null;
-  owner: { _id: Id<"users">; handle?: string; displayName?: string; image?: string } | null;
+  owner: {
+    _id: Id<"users">;
+    handle?: string;
+    displayName?: string;
+    image?: string;
+    official?: boolean | null;
+  } | null;
   moderationInfo?: {
     isPendingScan: boolean;
     isMalwareBlocked: boolean;
@@ -1266,6 +1273,7 @@ export async function searchSkillsV1Handler(ctx: ActionCtx, request: Request) {
               handle: result.owner.handle ?? null,
               displayName: result.owner.displayName ?? null,
               image: result.owner.image ?? null,
+              official: result.owner.official === true ? true : undefined,
             }
           : null;
         return {
@@ -1658,6 +1666,7 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
               userId: result.owner._id,
               displayName: result.owner.displayName ?? null,
               image: result.owner.image ?? null,
+              official: result.owner.official === true ? true : undefined,
             }
           : null,
         moderation: result.moderationInfo
