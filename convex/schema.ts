@@ -191,6 +191,7 @@ const users = defineTable({
   .index("phone", ["phone"])
   .index("handle", ["handle"])
   .index("by_ban_reason_deleted_at", ["banReason", "deletedAt"])
+  .index("by_deactivated_purged_at", ["deactivatedAt", "purgedAt"])
   .index("by_active_handle", ["deletedAt", "deactivatedAt", "handle"]);
 
 const publishers = defineTable({
@@ -817,6 +818,7 @@ const skillVersions = defineTable({
   ),
   changelog: v.string(),
   changelogSource: v.optional(v.union(v.literal("auto"), v.literal("user"))),
+  icon: v.optional(v.string()),
   files: v.array(
     v.object({
       path: v.string(),
@@ -1241,6 +1243,8 @@ const packageReleases = defineTable({
   normalizedBundleManifest: v.optional(v.any()),
   compatibility: packageCompatibilityValidator,
   capabilities: packageCapabilitiesValidator,
+  runtimeId: v.optional(v.string()),
+  sourceRepo: v.optional(v.string()),
   verification: packageVerificationValidator,
   sha256hash: v.optional(v.string()),
   vtAnalysis: v.optional(vtAnalysisValidator),
@@ -1408,7 +1412,9 @@ const packageStatEvents = defineTable({
   kind: v.union(v.literal("download"), v.literal("install")),
   occurredAt: v.number(),
   processedAt: v.optional(v.number()),
-}).index("by_unprocessed", ["processedAt"]);
+})
+  .index("by_unprocessed", ["processedAt"])
+  .index("by_package", ["packageId"]);
 
 const packageTrustedPublishers = defineTable({
   packageId: v.id("packages"),
@@ -1463,7 +1469,7 @@ const packagePublishUploadTickets = defineTable({
   expiresAt: v.number(),
   usedAt: v.optional(v.number()),
   storageId: v.optional(v.id("_storage")),
-});
+}).index("by_publish_token", ["publishTokenId"]);
 
 const packageSearchDigest = defineTable({
   packageId: v.id("packages"),
@@ -2005,6 +2011,7 @@ const packageAppeals = defineTable({
   actionTaken: v.optional(v.union(v.literal("none"), v.literal("approve"))),
   createdAt: v.number(),
 })
+  .index("by_package", ["packageId"])
   .index("by_release_status_createdAt", ["releaseId", "status", "createdAt"])
   .index("by_createdAt", ["createdAt"])
   .index("by_status_createdAt", ["status", "createdAt"])
@@ -2118,6 +2125,17 @@ const publisherAbuseScoreRuns = defineTable({
   sumSquaredLogPressure: v.number(),
   meanLogPressure: v.optional(v.number()),
   stdDevLogPressure: v.optional(v.number()),
+  temporalBenchmark: v.optional(
+    v.object({
+      sampleSize: v.number(),
+      downloads30dAverage: v.number(),
+      downloads30dMedian: v.number(),
+      downloads30dP95: v.number(),
+      downloads30dP99: v.number(),
+      spikeMultiplier7dP95: v.number(),
+      spikeMultiplier7dP99: v.number(),
+    }),
+  ),
   errorMessage: v.optional(v.string()),
 })
   .index("by_status_and_updated_at", ["status", "updatedAt"])
@@ -2148,6 +2166,17 @@ const publisherAbuseScores = defineTable({
   temporalSpikeSkillCount: v.optional(v.number()),
   temporalSustainedSkillCount: v.optional(v.number()),
   temporalMaxPressure: v.optional(v.number()),
+  temporalBenchmark: v.optional(
+    v.object({
+      sampleSize: v.number(),
+      downloads30dAverage: v.number(),
+      downloads30dMedian: v.number(),
+      downloads30dP95: v.number(),
+      downloads30dP99: v.number(),
+      spikeMultiplier7dP95: v.number(),
+      spikeMultiplier7dP99: v.number(),
+    }),
+  ),
   temporalEvidence: v.optional(
     v.array(
       v.object({
@@ -2165,6 +2194,10 @@ const publisherAbuseScores = defineTable({
         recent30Downloads: v.number(),
         recent30Installs: v.number(),
         downloadInstallRatio30: v.number(),
+        downloads30dCohortBand: v.optional(v.union(v.literal("p95"), v.literal("p99"))),
+        spikeMultiplierCohortBand: v.optional(v.union(v.literal("p95"), v.literal("p99"))),
+        downloads30dVsPeerP95: v.optional(v.number()),
+        spikeMultiplierVsPeerP95: v.optional(v.number()),
         spikeWindowStartDay: v.optional(v.number()),
         spikeWindowEndDay: v.optional(v.number()),
         sustainedWindowStartDay: v.optional(v.number()),

@@ -493,7 +493,7 @@ async function patchStructuredModerationFromVersion(
   skill: Doc<"skills">,
   version: Pick<
     Doc<"skillVersions">,
-    "_id" | "staticScan" | "vtAnalysis" | "llmAnalysis" | "sha256hash"
+    "_id" | "version" | "staticScan" | "vtAnalysis" | "llmAnalysis" | "sha256hash"
   >,
 ) {
   const now = Date.now();
@@ -513,11 +513,17 @@ async function patchStructuredModerationFromVersion(
   const shouldPersistClawScanMalwareBlock =
     patch.moderationVerdict === "malicious" && isClawScanMaliciousAnalysis(version.llmAnalysis);
 
+  if (shouldPersistClawScanMalwareBlock) {
+    await scheduleClawScanMaliciousArtifactFinding(ctx, skill, version, patch);
+    await quarantineMaliciousLatestSkillVersion(ctx, skill, version, owner, now, patch);
+    return;
+  }
+
   // A ClawScan-malicious result is itself a security lock. Persist it even
   // when the skill was already hidden by a user or quality hold so a later
   // hold lift cannot restore a latest-version malware verdict.
-  if (shouldPreserveExistingModerationLock(skill) && !shouldPersistClawScanMalwareBlock) {
-    await scheduleClawScanAutobanForMalware(ctx, skill, version, patch);
+  if (shouldPreserveExistingModerationLock(skill)) {
+    await scheduleClawScanMaliciousArtifactFinding(ctx, skill, version, patch);
     return;
   }
 
@@ -525,13 +531,206 @@ async function patchStructuredModerationFromVersion(
   await ctx.db.patch(skill._id, patch);
   await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
 
-  await scheduleClawScanAutobanForMalware(ctx, skill, version, patch);
+  await scheduleClawScanMaliciousArtifactFinding(ctx, skill, version, patch);
 }
 
-async function scheduleClawScanAutobanForMalware(
+function latestVersionSummaryFromSkillVersion(
+  version: Pick<
+    Doc<"skillVersions">,
+    "version" | "createdAt" | "changelog" | "changelogSource" | "parsed" | "apiKeyRequired"
+  >,
+): NonNullable<Doc<"skills">["latestVersionSummary"]> {
+  return {
+    version: version.version,
+    createdAt: version.createdAt,
+    changelog: version.changelog,
+    changelogSource: version.changelogSource,
+    clawdis: version.parsed?.clawdis,
+    apiKeyRequired: version.apiKeyRequired,
+  };
+}
+
+function skillSummaryFromSkillVersion(
+  version: Pick<Doc<"skillVersions">, "parsed"> | null | undefined,
+) {
+  return version?.parsed?.frontmatter
+    ? getFrontmatterValue(version.parsed.frontmatter, "description")?.trim() || undefined
+    : undefined;
+}
+
+function skillDisplayNameFromSkillVersion(
+  version: Pick<Doc<"skillVersions">, "parsed"> | null | undefined,
+) {
+  return version?.parsed?.frontmatter
+    ? getFrontmatterValue(version.parsed.frontmatter, "name")?.trim() || undefined
+    : undefined;
+}
+
+function skillIconFromSkillVersion(version: Pick<Doc<"skillVersions">, "icon"> | null | undefined) {
+  return version && "icon" in version ? version.icon : undefined;
+}
+
+function isKnownMaliciousSkillVersion(
+  version: Pick<Doc<"skillVersions">, "_id" | "staticScan" | "vtAnalysis" | "llmAnalysis">,
+) {
+  const patch = buildStructuredModerationPatch({
+    staticScan: version.staticScan,
+    vtAnalysis: version.vtAnalysis,
+    llmAnalysis: version.llmAnalysis,
+    vtStatus: version.vtAnalysis?.status,
+    llmStatus: version.llmAnalysis?.status,
+    sourceVersionId: version._id,
+  });
+  return patch.moderationVerdict === "malicious";
+}
+
+function compareSkillVersionsForRestore(
+  left: Pick<Doc<"skillVersions">, "version" | "createdAt">,
+  right: Pick<Doc<"skillVersions">, "version" | "createdAt">,
+) {
+  const leftValid = semver.valid(left.version);
+  const rightValid = semver.valid(right.version);
+  if (leftValid && rightValid) return semver.rcompare(leftValid, rightValid);
+  if (leftValid) return -1;
+  if (rightValid) return 1;
+  return right.createdAt - left.createdAt;
+}
+
+async function findReplacementLatestSkillVersion(
+  ctx: MutationCtx,
+  skillId: Id<"skills">,
+  quarantinedVersionId: Id<"skillVersions">,
+) {
+  const versions = await ctx.db
+    .query("skillVersions")
+    .withIndex("by_skill", (q) => q.eq("skillId", skillId))
+    .collect();
+  return (
+    versions
+      .filter(
+        (candidate) =>
+          candidate._id !== quarantinedVersionId &&
+          !candidate.softDeletedAt &&
+          !isKnownMaliciousSkillVersion(candidate),
+      )
+      .sort(compareSkillVersionsForRestore)[0] ?? null
+  );
+}
+
+async function clearSkillEmbeddingsLatestVersion(
+  ctx: MutationCtx,
+  skillId: Id<"skills">,
+  now: number,
+) {
+  const embeddings = await listSkillEmbeddingsForSkill(ctx, skillId);
+  for (const embedding of embeddings) {
+    if (
+      !embedding.isLatest &&
+      embedding.visibility === embeddingVisibilityFor(false, embedding.isApproved)
+    ) {
+      continue;
+    }
+    await ctx.db.patch(embedding._id, {
+      isLatest: false,
+      visibility: embeddingVisibilityFor(false, embedding.isApproved),
+      updatedAt: now,
+    });
+  }
+}
+
+async function quarantineMaliciousLatestSkillVersion(
   ctx: MutationCtx,
   skill: Doc<"skills">,
-  version: Pick<Doc<"skillVersions">, "llmAnalysis" | "sha256hash">,
+  version: Pick<Doc<"skillVersions">, "_id">,
+  owner: Doc<"users"> | null | undefined,
+  now: number,
+  maliciousPatch: SkillModerationPatch,
+) {
+  await ctx.db.patch(version._id, { softDeletedAt: now });
+
+  const replacement = await findReplacementLatestSkillVersion(ctx, skill._id, version._id);
+  const nextTags: Record<string, Id<"skillVersions">> = {};
+  for (const [tag, versionId] of Object.entries(skill.tags ?? {})) {
+    if (versionId === version._id || tag === "latest") continue;
+    nextTags[tag] = versionId;
+  }
+  if (replacement) {
+    nextTags.latest = replacement._id;
+  }
+
+  const patch: Partial<Doc<"skills">> = {
+    displayName: replacement
+      ? (skillDisplayNameFromSkillVersion(replacement) ?? skill.slug)
+      : skill.displayName,
+    summary: replacement ? skillSummaryFromSkillVersion(replacement) : skill.summary,
+    icon: replacement ? (skillIconFromSkillVersion(replacement) ?? skill.icon) : skill.icon,
+    latestVersionId: replacement?._id,
+    latestVersionSummary: replacement
+      ? latestVersionSummaryFromSkillVersion(replacement)
+      : undefined,
+    tags: nextTags,
+    capabilityTags: replacement?.capabilityTags,
+    updatedAt: now,
+  };
+
+  if (!shouldPreserveExistingModerationLock(skill)) {
+    const basePatch = replacement
+      ? buildScannerModerationPatchFromVersion({
+          owner,
+          version: replacement,
+          now,
+        })
+      : maliciousPatch;
+    Object.assign(
+      patch,
+      applySkillManualOverrideToSkillPatch({
+        skill,
+        basePatch,
+        now,
+        stripUpdatedAt: true,
+      }),
+    );
+  }
+
+  const nextSkill = { ...skill, ...patch } as Doc<"skills">;
+  await ctx.db.patch(skill._id, patch);
+  await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
+  await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
+
+  if (replacement) {
+    await setSkillEmbeddingsLatestVersion(ctx, skill._id, replacement._id, now);
+  } else {
+    await clearSkillEmbeddingsLatestVersion(ctx, skill._id, now);
+  }
+  await syncSkillSearchDigestForSkillDoc(ctx, nextSkill);
+}
+
+async function quarantineMaliciousNonLatestSkillVersion(
+  ctx: MutationCtx,
+  skill: Doc<"skills">,
+  versionId: Id<"skillVersions">,
+  now: number,
+) {
+  await ctx.db.patch(versionId, { softDeletedAt: now });
+  const nextTags = Object.fromEntries(
+    Object.entries(skill.tags ?? {}).filter(([, taggedVersionId]) => taggedVersionId !== versionId),
+  ) as Record<string, Id<"skillVersions">>;
+  if (Object.keys(nextTags).length === Object.keys(skill.tags ?? {}).length) return;
+
+  const patch: Partial<Doc<"skills">> = {
+    tags: nextTags,
+    updatedAt: now,
+  };
+  const nextSkill = { ...skill, ...patch } as Doc<"skills">;
+  await ctx.db.patch(skill._id, patch);
+  await syncSkillSearchDigestForSkillDoc(ctx, nextSkill);
+}
+
+async function scheduleClawScanMaliciousArtifactFinding(
+  ctx: MutationCtx,
+  skill: Doc<"skills">,
+  version: Pick<Doc<"skillVersions">, "llmAnalysis" | "sha256hash" | "version"> &
+    Partial<Pick<Doc<"skillVersions">, "createdBy">>,
   patch: SkillModerationPatch,
 ) {
   if (
@@ -539,9 +738,11 @@ async function scheduleClawScanAutobanForMalware(
     skill.ownerUserId &&
     isClawScanMaliciousAnalysis(version.llmAnalysis)
   ) {
-    await ctx.scheduler.runAfter(0, internal.users.autobanMalwareAuthorInternal, {
-      ownerUserId: skill.ownerUserId,
-      slug: skill.slug,
+    await ctx.scheduler.runAfter(0, internal.users.recordMaliciousArtifactFindingInternal, {
+      ownerUserId: version.createdBy ?? skill.ownerUserId,
+      artifactKind: "skill",
+      artifactName: skill.slug,
+      version: version.version,
       ...(version.sha256hash ? { sha256hash: version.sha256hash } : {}),
       trigger:
         patch.moderationReasonCodes?.find((code) => code.startsWith("malicious.llm_")) ??
@@ -1379,6 +1580,15 @@ const HARD_DELETE_PHASES = [
 ] as const;
 
 type HardDeletePhase = (typeof HARD_DELETE_PHASES)[number];
+type HardDeleteSource = "admin" | "account.delete" | "publisher.delete";
+type HardDeleteScope = {
+  source?: HardDeleteSource;
+  ownerPublisherId?: Id<"publishers">;
+};
+
+const hardDeleteSourceValidator = v.optional(
+  v.union(v.literal("admin"), v.literal("account.delete"), v.literal("publisher.delete")),
+);
 
 function isHardDeletePhase(value: string | undefined): value is HardDeletePhase {
   if (!value) return false;
@@ -1390,11 +1600,14 @@ async function scheduleHardDelete(
   skillId: Id<"skills">,
   actorUserId: Id<"users">,
   phase: HardDeletePhase,
+  scope: HardDeleteScope = {},
 ) {
   await ctx.scheduler.runAfter(0, internal.skills.hardDeleteInternal, {
     skillId,
     actorUserId,
     phase,
+    source: scope.source,
+    ownerPublisherId: scope.ownerPublisherId,
   });
 }
 
@@ -1403,6 +1616,7 @@ async function hardDeleteSkillStep(
   skill: Doc<"skills">,
   actorUserId: Id<"users">,
   phase: HardDeletePhase,
+  scope: HardDeleteScope = {},
 ) {
   const now = Date.now();
   const patch: Partial<Doc<"skills">> = {};
@@ -1429,10 +1643,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(version._id);
       }
       if (versions.length === HARD_DELETE_VERSION_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "versions");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "versions", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "fingerprints");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "fingerprints", scope);
       return;
     }
     case "fingerprints": {
@@ -1444,10 +1658,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(fingerprint._id);
       }
       if (fingerprints.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "fingerprints");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "fingerprints", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "skillCardJobs");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "skillCardJobs", scope);
       return;
     }
     case "skillCardJobs": {
@@ -1459,10 +1673,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(job._id);
       }
       if (jobs.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "skillCardJobs");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "skillCardJobs", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "embeddings");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "embeddings", scope);
       return;
     }
     case "embeddings": {
@@ -1471,13 +1685,18 @@ async function hardDeleteSkillStep(
         .withIndex("by_skill", (q) => q.eq("skillId", skill._id))
         .take(HARD_DELETE_BATCH_SIZE);
       for (const embedding of embeddings) {
+        const maps = await ctx.db
+          .query("embeddingSkillMap")
+          .withIndex("by_embedding", (q) => q.eq("embeddingId", embedding._id))
+          .collect();
+        for (const map of maps) await ctx.db.delete(map._id);
         await ctx.db.delete(embedding._id);
       }
       if (embeddings.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "embeddings");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "embeddings", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "comments");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "comments", scope);
       return;
     }
     case "comments": {
@@ -1489,10 +1708,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(comment._id);
       }
       if (comments.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "comments");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "comments", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "commentReports");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "commentReports", scope);
       return;
     }
     case "commentReports": {
@@ -1504,10 +1723,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(report._id);
       }
       if (commentReports.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "commentReports");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "commentReports", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "reports");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "reports", scope);
       return;
     }
     case "reports": {
@@ -1519,10 +1738,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(report._id);
       }
       if (reports.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "reports");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "reports", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "stars");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "stars", scope);
       return;
     }
     case "stars": {
@@ -1534,10 +1753,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(star._id);
       }
       if (stars.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "stars");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "stars", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "badges");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "badges", scope);
       return;
     }
     case "badges": {
@@ -1549,10 +1768,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(badge._id);
       }
       if (badges.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "badges");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "badges", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "dailyStats");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "dailyStats", scope);
       return;
     }
     case "dailyStats": {
@@ -1564,10 +1783,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(stat._id);
       }
       if (dailyStats.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "dailyStats");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "dailyStats", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "statEvents");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "statEvents", scope);
       return;
     }
     case "statEvents": {
@@ -1579,10 +1798,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(statEvent._id);
       }
       if (statEvents.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "statEvents");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "statEvents", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "installs");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "installs", scope);
       return;
     }
     case "installs": {
@@ -1594,10 +1813,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(install._id);
       }
       if (installs.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "installs");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "installs", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "rootInstalls");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "rootInstalls", scope);
       return;
     }
     case "rootInstalls": {
@@ -1609,10 +1828,10 @@ async function hardDeleteSkillStep(
         await ctx.db.delete(rootInstall._id);
       }
       if (rootInstalls.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "rootInstalls");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "rootInstalls", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "leaderboards");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "leaderboards", scope);
       return;
     }
     case "leaderboards": {
@@ -1626,10 +1845,10 @@ async function hardDeleteSkillStep(
         }
       }
       if (leaderboards.length === HARD_DELETE_LEADERBOARD_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "leaderboards");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "leaderboards", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "canonical");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "canonical", scope);
       return;
     }
     case "canonical": {
@@ -1644,10 +1863,10 @@ async function hardDeleteSkillStep(
         });
       }
       if (canonicalRefs.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "canonical");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "canonical", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "forks");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "forks", scope);
       return;
     }
     case "forks": {
@@ -1662,10 +1881,10 @@ async function hardDeleteSkillStep(
         });
       }
       if (forkRefs.length === HARD_DELETE_BATCH_SIZE) {
-        await scheduleHardDelete(ctx, skill._id, actorUserId, "forks");
+        await scheduleHardDelete(ctx, skill._id, actorUserId, "forks", scope);
         return;
       }
-      await scheduleHardDelete(ctx, skill._id, actorUserId, "finalize");
+      await scheduleHardDelete(ctx, skill._id, actorUserId, "finalize", scope);
       return;
     }
     case "finalize": {
@@ -7476,7 +7695,7 @@ export const applyPublisherDeletionToOwnedSkillsBatchInternal = internalMutation
   },
   handler: async (ctx, args) => {
     const publisher = await ctx.db.get(args.ownerPublisherId);
-    if (!publisher || publisher.deletedAt !== args.deletedAt) {
+    if (publisher && publisher.deletedAt !== args.deletedAt) {
       return { ok: true as const, hiddenCount: 0, scheduled: false, stale: true as const };
     }
 
@@ -7491,29 +7710,10 @@ export const applyPublisherDeletionToOwnedSkillsBatchInternal = internalMutation
 
     let hiddenCount = 0;
     for (const skill of page) {
-      if (skill.softDeletedAt) continue;
-
-      const patch: Partial<Doc<"skills">> = {
-        softDeletedAt: args.deletedAt,
-        moderationStatus: "hidden",
-        moderationReason: "publisher.deleted",
-        hiddenAt: args.deletedAt,
-        hiddenBy: args.actorUserId,
-        lastReviewedAt: args.deletedAt,
-        unpublishedSlugReservedUntil: undefined,
-        unpublishedSlugReleasedAt: undefined,
-        unpublishedOriginalSlug: undefined,
-        updatedAt: args.deletedAt,
-        isSuspicious: computeIsSuspicious({
-          moderationFlags: skill.moderationFlags,
-          moderationReason: "publisher.deleted",
-        }),
-      };
-      const nextSkill = { ...skill, ...patch };
-      await ctx.db.patch(skill._id, patch);
-      await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
-      await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
-      await setSkillEmbeddingsSoftDeleted(ctx, skill._id, true, args.deletedAt);
+      await hardDeleteSkillStep(ctx, skill, args.actorUserId, "versions", {
+        source: "publisher.delete",
+        ownerPublisherId: args.ownerPublisherId,
+      });
       hiddenCount += 1;
     }
 
@@ -7548,33 +7748,10 @@ export const applyAccountDeletionToOwnedSkillsBatchInternal = internalMutation({
 
     let hiddenCount = 0;
     for (const skill of page) {
-      if (skill.ownerPublisherId) {
-        const ownerPublisher = await ctx.db.get(skill.ownerPublisherId);
-        if (ownerPublisher?.kind === "org") continue;
-      }
-      if (skill.softDeletedAt) continue;
-
-      const patch: Partial<Doc<"skills">> = {
-        softDeletedAt: args.deletedAt,
-        moderationStatus: "hidden",
-        moderationReason: "user.deactivated",
-        hiddenAt: args.deletedAt,
-        hiddenBy: args.hiddenBy,
-        lastReviewedAt: args.deletedAt,
-        unpublishedSlugReservedUntil: undefined,
-        unpublishedSlugReleasedAt: undefined,
-        unpublishedOriginalSlug: undefined,
-        updatedAt: args.deletedAt,
-        isSuspicious: computeIsSuspicious({
-          moderationFlags: skill.moderationFlags,
-          moderationReason: "user.deactivated",
-        }),
-      };
-      const nextSkill = { ...skill, ...patch };
-      await ctx.db.patch(skill._id, patch);
-      await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
-      await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
-      await setSkillEmbeddingsSoftDeleted(ctx, skill._id, true, args.deletedAt);
+      if (skill.ownerPublisherId) continue;
+      await hardDeleteSkillStep(ctx, skill, args.hiddenBy ?? args.ownerUserId, "versions", {
+        source: "account.delete",
+      });
       hiddenCount += 1;
     }
 
@@ -8096,7 +8273,30 @@ export const updateVersionLlmAnalysisInternal = internalMutation({
     if (args.moderationMode === "preserve") return;
 
     const skill = await ctx.db.get(version.skillId);
-    if (!skill || skill.latestVersionId !== version._id) return;
+    if (!skill) return;
+    if (skill.latestVersionId !== version._id) {
+      const owner = skill.ownerUserId ? await ctx.db.get(skill.ownerUserId) : null;
+      const now = Date.now();
+      const basePatch = buildScannerModerationPatchFromVersion({
+        owner,
+        version: nextVersion,
+        now,
+      });
+      const patch = applySkillManualOverrideToSkillPatch({
+        skill,
+        basePatch,
+        now,
+        stripUpdatedAt: true,
+      });
+      if (
+        patch.moderationVerdict === "malicious" &&
+        isClawScanMaliciousAnalysis(args.llmAnalysis)
+      ) {
+        await scheduleClawScanMaliciousArtifactFinding(ctx, skill, nextVersion, patch);
+        await quarantineMaliciousNonLatestSkillVersion(ctx, skill, version._id, now);
+      }
+      return;
+    }
     await patchStructuredModerationFromVersion(ctx, skill, nextVersion);
   },
 });
@@ -10199,15 +10399,33 @@ export const hardDeleteInternal = internalMutation({
     skillId: v.id("skills"),
     actorUserId: v.id("users"),
     phase: v.optional(v.string()),
+    source: hardDeleteSourceValidator,
+    ownerPublisherId: v.optional(v.id("publishers")),
   },
   handler: async (ctx, args) => {
     const actor = await ctx.db.get(args.actorUserId);
-    if (!actor || actor.deletedAt || actor.deactivatedAt) throw new Error("User not found");
-    assertAdmin(actor);
     const skill = await ctx.db.get(args.skillId);
     if (!skill) return;
+    const source = args.source ?? "admin";
+    if (source === "admin") {
+      if (!actor || actor.deletedAt || actor.deactivatedAt) throw new Error("User not found");
+      assertAdmin(actor);
+    } else if (source === "account.delete") {
+      if (!actor) throw new Error("User not found");
+      if (skill.ownerUserId !== args.actorUserId || skill.ownerPublisherId) {
+        throw new Error("Skill is outside account deletion scope");
+      }
+    } else {
+      if (!actor) throw new Error("User not found");
+      if (!args.ownerPublisherId || skill.ownerPublisherId !== args.ownerPublisherId) {
+        throw new Error("Skill is outside publisher deletion scope");
+      }
+    }
     const phase = isHardDeletePhase(args.phase) ? args.phase : "versions";
-    await hardDeleteSkillStep(ctx, skill, actor._id, phase);
+    await hardDeleteSkillStep(ctx, skill, args.actorUserId, phase, {
+      source,
+      ownerPublisherId: args.ownerPublisherId,
+    });
   },
 });
 
@@ -10719,13 +10937,16 @@ export const insertVersion = internalMutation({
     }
 
     if (!skill) throw new Error("Skill creation failed");
+    const versionIcon = args.icon !== undefined ? normalizeSkillIconValue(args.icon) : skill.icon;
 
     const existingVersion = await ctx.db
       .query("skillVersions")
       .withIndex("by_skill_version", (q) => q.eq("skillId", skill._id).eq("version", args.version))
       .unique();
     if (existingVersion) {
-      throw new ConvexError("Version already exists");
+      throw new ConvexError(
+        `Version ${args.version} already exists. Increment the version number and try again.`,
+      );
     }
 
     const versionId = await ctx.db.insert("skillVersions", {
@@ -10735,6 +10956,7 @@ export const insertVersion = internalMutation({
       sourceProvenance: args.sourceProvenance,
       changelog: args.changelog,
       changelogSource: args.changelogSource,
+      icon: versionIcon,
       files: args.files,
       parsed: args.parsed,
       capabilityTags: args.capabilityTags,
@@ -10793,8 +11015,7 @@ export const insertVersion = internalMutation({
     // displayName / summary so backport publishes can't surprise the card.
     // Only update when the publisher explicitly picked one this time —
     // omitting `args.icon` keeps the previously stored value.
-    const nextIcon =
-      isNewLatest && args.icon !== undefined ? normalizeSkillIconValue(args.icon) : skill.icon;
+    const nextIcon = isNewLatest ? versionIcon : skill.icon;
     const derivedFlags = deriveModerationFlags({
       skill: {
         slug: skill.slug,

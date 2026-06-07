@@ -48,10 +48,24 @@ function makeCtx({
         }),
       };
     }
+    if (table === "skillVersions") {
+      return {
+        withIndex: () => ({
+          take: async () => [],
+        }),
+      };
+    }
     if (table === "skillEmbeddings") {
       return {
         withIndex: () => ({
           collect: async () => [],
+        }),
+      };
+    }
+    if (table === "skillVersions") {
+      return {
+        withIndex: () => ({
+          take: async () => [],
         }),
       };
     }
@@ -82,8 +96,8 @@ function makeCtx({
 }
 
 describe("skills ban/unban batches", () => {
-  it("soft-deletes active skills for a deleted publisher", async () => {
-    const { ctx, patch } = makeCtx({
+  it("starts hard-delete cleanup for active skills owned by a deleted publisher", async () => {
+    const { ctx, patch, scheduler } = makeCtx({
       user: { _id: "users:owner", deletedAt: undefined, deactivatedAt: undefined },
       skills: [
         {
@@ -91,6 +105,7 @@ describe("skills ban/unban batches", () => {
           ownerUserId: "users:owner",
           ownerPublisherId: "publishers:org",
           softDeletedAt: undefined,
+          hiddenAt: undefined,
           moderationStatus: "active",
           moderationFlags: undefined,
           stats: {
@@ -120,10 +135,21 @@ describe("skills ban/unban batches", () => {
     expect(patch).toHaveBeenCalledWith(
       "skills:org-skill",
       expect.objectContaining({
-        softDeletedAt: 3_000,
-        moderationStatus: "hidden",
-        moderationReason: "publisher.deleted",
+        softDeletedAt: expect.any(Number),
+        hiddenAt: expect.any(Number),
+        moderationStatus: "removed",
         hiddenBy: "users:owner",
+      }),
+    );
+    expect(scheduler.runAfter).toHaveBeenCalledWith(
+      0,
+      expect.anything(),
+      expect.objectContaining({
+        skillId: "skills:org-skill",
+        actorUserId: "users:owner",
+        phase: "fingerprints",
+        source: "publisher.delete",
+        ownerPublisherId: "publishers:org",
       }),
     );
   });

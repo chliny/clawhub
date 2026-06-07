@@ -291,6 +291,10 @@ type PackageSoftDeletedReason = "user.banned" | "user.deactivated" | "publisher.
 const ownedPackageScanScopeValidator = v.optional(
   v.union(v.literal("ownerUserId"), v.literal("personalPublisher")),
 );
+const hardDeletePackageSourceValidator = v.union(
+  v.literal("account.delete"),
+  v.literal("publisher.delete"),
+);
 type OwnedPackageScanScope = "ownerUserId" | "personalPublisher";
 type PackagePublishActor =
   | {
@@ -3084,6 +3088,146 @@ async function softDeletePackageDoc(
   };
 }
 
+async function deletePackageModerationEventsForReport(
+  ctx: Pick<MutationCtx, "db">,
+  reportId: Id<"packageReports">,
+) {
+  const logs = await ctx.db
+    .query("packageModerationEventLogs")
+    .withIndex("by_report_createdAt", (q) => q.eq("reportId", reportId))
+    .collect();
+  for (const log of logs) await ctx.db.delete(log._id);
+}
+
+async function deletePackageModerationEventsForAppeal(
+  ctx: Pick<MutationCtx, "db">,
+  appealId: Id<"packageAppeals">,
+) {
+  const logs = await ctx.db
+    .query("packageModerationEventLogs")
+    .withIndex("by_appeal_createdAt", (q) => q.eq("appealId", appealId))
+    .collect();
+  for (const log of logs) await ctx.db.delete(log._id);
+}
+
+async function hardDeletePackageDoc(
+  ctx: Pick<MutationCtx, "db">,
+  pkg: Doc<"packages">,
+  params: {
+    actorUserId: Id<"users">;
+    deletedAt: number;
+    source: "account.delete" | "publisher.delete";
+  },
+) {
+  const releases = await ctx.db
+    .query("packageReleases")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const release of releases) {
+    const jobs = await ctx.db
+      .query("securityScanJobs")
+      .withIndex("by_package_release", (q) => q.eq("packageReleaseId", release._id))
+      .collect();
+    for (const job of jobs) await ctx.db.delete(job._id);
+  }
+
+  const reports = await ctx.db
+    .query("packageReports")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const report of reports) {
+    await deletePackageModerationEventsForReport(ctx, report._id);
+    await ctx.db.delete(report._id);
+  }
+
+  const appeals = await ctx.db
+    .query("packageAppeals")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const appeal of appeals) {
+    await deletePackageModerationEventsForAppeal(ctx, appeal._id);
+    await ctx.db.delete(appeal._id);
+  }
+
+  const badges = await ctx.db
+    .query("packageBadges")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const badge of badges) await ctx.db.delete(badge._id);
+
+  const trustedPublishers = await ctx.db
+    .query("packageTrustedPublishers")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const trustedPublisher of trustedPublishers) await ctx.db.delete(trustedPublisher._id);
+
+  const tokens = await ctx.db
+    .query("packagePublishTokens")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const token of tokens) {
+    const tickets = await ctx.db
+      .query("packagePublishUploadTickets")
+      .withIndex("by_publish_token", (q) => q.eq("publishTokenId", token._id))
+      .collect();
+    for (const ticket of tickets) await ctx.db.delete(ticket._id);
+    await ctx.db.delete(token._id);
+  }
+
+  const statEvents = await ctx.db
+    .query("packageStatEvents")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  for (const statEvent of statEvents) await ctx.db.delete(statEvent._id);
+
+  for (const release of releases) await ctx.db.delete(release._id);
+  await ctx.db.delete(pkg._id);
+  await ctx.db.insert("auditLogs", {
+    actorUserId: params.actorUserId,
+    action: "package.hard_delete",
+    targetType: "package",
+    targetId: pkg._id,
+    metadata: {
+      name: pkg.name,
+      normalizedName: pkg.normalizedName,
+      ownerUserId: pkg.ownerUserId,
+      ownerPublisherId: pkg.ownerPublisherId,
+      source: params.source,
+      releases: releases.length,
+      reports: reports.length,
+      appeals: appeals.length,
+      publishTokens: tokens.length,
+    },
+    createdAt: params.deletedAt,
+  });
+
+  return {
+    ok: true as const,
+    packageId: pkg._id,
+    releaseCount: releases.length,
+    revokedTokenCount: tokens.length,
+  };
+}
+
+export const hardDeletePackageInternal = internalMutation({
+  args: {
+    packageId: v.id("packages"),
+    actorUserId: v.id("users"),
+    deletedAt: v.number(),
+    source: hardDeletePackageSourceValidator,
+  },
+  handler: async (ctx, args) => {
+    const pkg = await ctx.db.get(args.packageId);
+    if (!pkg) return { ok: true as const, deleted: false as const };
+    const result = await hardDeletePackageDoc(ctx, pkg, {
+      actorUserId: args.actorUserId,
+      deletedAt: args.deletedAt,
+      source: args.source,
+    });
+    return { ...result, deleted: true as const };
+  },
+});
+
 function comparePackageRestoreLatestCandidates(
   family: Doc<"packages">["family"],
   a: Doc<"packageReleases">,
@@ -3136,6 +3280,28 @@ function rebuildPackageTagsFromActiveReleases(releases: Doc<"packageReleases">[]
     }
   }
   return tags;
+}
+
+function packageLatestSummaryFromRelease(release: Doc<"packageReleases"> | null) {
+  return release
+    ? {
+        version: release.version,
+        createdAt: release.createdAt,
+        changelog: release.changelog,
+        compatibility: release.compatibility,
+        capabilities: release.capabilities,
+        verification: release.verification,
+        artifact: packageArtifactSummary(release),
+      }
+    : undefined;
+}
+
+function packageRuntimeIdFromRelease(release: Doc<"packageReleases"> | null) {
+  return release?.runtimeId ?? release?.capabilities?.runtimeId;
+}
+
+function packageSourceRepoFromRelease(release: Doc<"packageReleases"> | null) {
+  return release?.sourceRepo ?? release?.verification?.sourceRepo;
 }
 
 async function restorePackageDoc(
@@ -3237,7 +3403,7 @@ async function restorePackageDoc(
     compatibility: nextLatest?.compatibility,
     capabilities: nextLatest?.capabilities,
     verification: nextLatest?.verification,
-    scanStatus: nextLatest ? resolvePackageReleaseScanStatus(nextLatest) : undefined,
+    scanStatus: nextLatest ? resolvePackageReleaseScanStatus(nextLatest) : pkg.scanStatus,
     updatedAt: now,
   };
   const nextPackage: Doc<"packages"> = { ...pkg, ...packagePatch };
@@ -3604,16 +3770,17 @@ export const applyAccountDeletionToOwnedPackagesBatchInternal = internalMutation
     for (const pkg of page) {
       if (shouldSkipOwnedPackageScanRow(pkg, args)) continue;
       if (!(await isPackageOwnedByPersonalUser(ctx, pkg, owner))) continue;
-      const revokeResult = await revokePackagePublishTokensForPackage(ctx, pkg._id, args.deletedAt);
-      revokedTokenCount += revokeResult.revokedCount;
-      if (pkg.softDeletedAt) continue;
-
       await softDeletePackageDoc(ctx, pkg, {
         actorUserId: args.ownerUserId,
-        actorRole: "user",
         deletedAt: args.deletedAt,
         reason: "user.deactivated",
         source: "dashboard",
+      });
+      void ctx.scheduler.runAfter(0, internal.packages.hardDeletePackageInternal, {
+        packageId: pkg._id,
+        actorUserId: args.ownerUserId,
+        deletedAt: args.deletedAt,
+        source: "account.delete",
       });
       deletedCount += 1;
     }
@@ -3640,7 +3807,7 @@ export const applyPublisherDeletionToOwnedPackagesBatchInternal = internalMutati
   },
   handler: async (ctx, args) => {
     const publisher = await ctx.db.get(args.ownerPublisherId);
-    if (!publisher || publisher.deletedAt !== args.deletedAt) {
+    if (publisher && publisher.deletedAt !== args.deletedAt) {
       return {
         ok: true as const,
         deletedCount: 0,
@@ -3662,16 +3829,17 @@ export const applyPublisherDeletionToOwnedPackagesBatchInternal = internalMutati
     let deletedCount = 0;
     let revokedTokenCount = 0;
     for (const pkg of page) {
-      const revokeResult = await revokePackagePublishTokensForPackage(ctx, pkg._id, args.deletedAt);
-      revokedTokenCount += revokeResult.revokedCount;
-      if (pkg.softDeletedAt) continue;
-
       await softDeletePackageDoc(ctx, pkg, {
         actorUserId: args.actorUserId,
-        actorRole: "user",
         deletedAt: args.deletedAt,
         reason: "publisher.deleted",
         source: "dashboard",
+      });
+      void ctx.scheduler.runAfter(0, internal.packages.hardDeletePackageInternal, {
+        packageId: pkg._id,
+        actorUserId: args.actorUserId,
+        deletedAt: args.deletedAt,
+        source: "publisher.delete",
       });
       deletedCount += 1;
     }
@@ -6390,7 +6558,9 @@ export const insertReleaseInternal = internalMutation({
             releaseId: releaseExists._id,
           };
         }
-        throw new ConvexError(`Version ${nextVersionLabel} already exists`);
+        throw new ConvexError(
+          `Version ${nextVersionLabel} already exists. Increment the version number and try again.`,
+        );
       }
     }
     const priorReleases = existing
@@ -6428,6 +6598,8 @@ export const insertReleaseInternal = internalMutation({
       normalizedBundleManifest: args.normalizedBundleManifest,
       compatibility: args.compatibility,
       capabilities: nextCapabilities,
+      runtimeId: args.runtimeId,
+      sourceRepo: args.sourceRepo,
       verification: args.verification,
       staticScan: args.staticScan,
       source: args.source,
@@ -6499,10 +6671,186 @@ function isReleaseActive(
   return Boolean(release && !release.softDeletedAt);
 }
 
-async function syncLatestPackageVerification(ctx: MutationCtx, release: Doc<"packageReleases">) {
+async function recordMaliciousPluginReleaseFinding(
+  ctx: Pick<MutationCtx, "scheduler">,
+  pkg: Doc<"packages">,
+  release: Doc<"packageReleases">,
+  trigger: string,
+) {
+  await ctx.scheduler.runAfter(0, internal.users.recordMaliciousArtifactFindingInternal, {
+    ownerUserId: release.createdBy,
+    artifactKind: "plugin",
+    artifactName: pkg.normalizedName,
+    version: release.version,
+    trigger,
+    ...(release.sha256hash ? { sha256hash: release.sha256hash } : {}),
+  });
+}
+
+async function quarantineMaliciousNonLatestPackageRelease(
+  ctx: Pick<MutationCtx, "db"> & Partial<Pick<MutationCtx, "scheduler">>,
+  pkg: Doc<"packages">,
+  release: Doc<"packageReleases">,
+  trigger: string,
+) {
+  const now = Date.now();
+  const maliciousVerification = release.verification
+    ? { ...release.verification, scanStatus: "malicious" as const }
+    : release.verification;
+  await ctx.db.patch(release._id, {
+    verification: maliciousVerification,
+    softDeletedAt: now,
+  });
+
+  const nextTags = Object.fromEntries(
+    Object.entries(pkg.tags ?? {}).filter(([, releaseId]) => releaseId !== release._id),
+  ) as Doc<"packages">["tags"];
+  if (Object.keys(nextTags).length !== Object.keys(pkg.tags ?? {}).length) {
+    const packagePatch: Partial<Doc<"packages">> = {
+      tags: nextTags,
+      updatedAt: now,
+    };
+    const nextPackage: Doc<"packages"> = { ...pkg, ...packagePatch };
+    await ctx.db.patch(pkg._id, packagePatch);
+    const owner = await getOwnerPublisher(ctx, {
+      ownerPublisherId: pkg.ownerPublisherId,
+      ownerUserId: pkg.ownerUserId,
+    });
+    await upsertPackageSearchDigest(ctx, {
+      ...extractPackageDigestFields(nextPackage),
+      ownerHandle: owner?.handle ?? "",
+      ownerKind: owner?.kind,
+    });
+  }
+
+  if (ctx.scheduler) {
+    await recordMaliciousPluginReleaseFinding(
+      ctx as Pick<MutationCtx, "scheduler">,
+      pkg,
+      release,
+      trigger,
+    );
+  }
+}
+
+async function quarantineMaliciousLatestPackageRelease(
+  ctx: Pick<MutationCtx, "db"> & Partial<Pick<MutationCtx, "scheduler">>,
+  pkg: Doc<"packages">,
+  release: Doc<"packageReleases">,
+  trigger: string,
+) {
+  const now = Date.now();
+  const maliciousVerification = release.verification
+    ? { ...release.verification, scanStatus: "malicious" as const }
+    : release.verification;
+  const quarantinedRelease = {
+    ...release,
+    verification: maliciousVerification,
+    softDeletedAt: now,
+  } as Doc<"packageReleases">;
+
+  await ctx.db.patch(release._id, {
+    verification: maliciousVerification,
+    softDeletedAt: now,
+  });
+
+  const releases = await ctx.db
+    .query("packageReleases")
+    .withIndex("by_package", (q) => q.eq("packageId", pkg._id))
+    .collect();
+  const activeNonMaliciousReleases = releases
+    .map((candidate) => (candidate._id === release._id ? quarantinedRelease : candidate))
+    .filter(
+      (candidate) =>
+        !candidate.softDeletedAt && resolvePackageReleaseScanStatus(candidate) !== "malicious",
+    );
+  const nextLatest = getPreferredRestoredPackageRelease(pkg.family, activeNonMaliciousReleases);
+  const nextTags = rebuildPackageTagsFromActiveReleases(activeNonMaliciousReleases);
+  if (nextLatest) {
+    nextTags.latest = nextLatest._id;
+    if (!(nextLatest.distTags ?? []).includes("latest")) {
+      await ctx.db.patch(nextLatest._id, {
+        distTags: [...(nextLatest.distTags ?? []), "latest"],
+      });
+    }
+  }
+
+  const restoredRuntimeId = packageRuntimeIdFromRelease(nextLatest);
+  const restoredSourceRepo = packageSourceRepoFromRelease(nextLatest);
+  const packagePatch: Partial<Doc<"packages">> = {
+    tags: nextTags,
+    latestReleaseId: nextLatest?._id,
+    latestVersionSummary: packageLatestSummaryFromRelease(nextLatest),
+    summary: nextLatest?.summary,
+    sourceRepo: restoredSourceRepo,
+    runtimeId: restoredRuntimeId,
+    capabilityTags: nextLatest?.capabilities?.capabilityTags,
+    executesCode:
+      typeof nextLatest?.capabilities?.executesCode === "boolean"
+        ? nextLatest.capabilities.executesCode
+        : undefined,
+    compatibility: nextLatest?.compatibility,
+    capabilities: nextLatest?.capabilities,
+    verification: nextLatest?.verification,
+    scanStatus: nextLatest ? resolvePackageReleaseScanStatus(nextLatest) : "malicious",
+    updatedAt: now,
+  };
+  const nextPackage: Doc<"packages"> = { ...pkg, ...packagePatch };
+  await ctx.db.patch(pkg._id, packagePatch);
+  const owner = await getOwnerPublisher(ctx, {
+    ownerPublisherId: pkg.ownerPublisherId,
+    ownerUserId: pkg.ownerUserId,
+  });
+  await upsertPackageSearchDigest(ctx, {
+    ...extractPackageDigestFields(nextPackage),
+    ownerHandle: owner?.handle ?? "",
+    ownerKind: owner?.kind,
+  });
+
+  if (ctx.scheduler) {
+    await recordMaliciousPluginReleaseFinding(
+      ctx as Pick<MutationCtx, "scheduler">,
+      pkg,
+      release,
+      trigger,
+    );
+  }
+}
+
+type SyncLatestPackageVerificationOptions = {
+  quarantineMaliciousLatest?: boolean;
+  maliciousTrigger?: string;
+};
+
+async function syncLatestPackageVerification(
+  ctx: Pick<MutationCtx, "db"> & Partial<Pick<MutationCtx, "scheduler">>,
+  release: Doc<"packageReleases">,
+  options: SyncLatestPackageVerificationOptions = {},
+) {
   const pkg = await ctx.db.get(release.packageId);
-  if (!pkg || pkg.latestReleaseId !== release._id) return;
   const scanStatus = resolvePackageReleaseScanStatus(release);
+  if (!pkg) return;
+
+  if (scanStatus === "malicious" && options.quarantineMaliciousLatest) {
+    if (pkg.latestReleaseId !== release._id) {
+      await quarantineMaliciousNonLatestPackageRelease(
+        ctx,
+        pkg,
+        release,
+        options.maliciousTrigger ?? "malicious.llm_malicious",
+      );
+      return;
+    }
+    await quarantineMaliciousLatestPackageRelease(
+      ctx,
+      pkg,
+      release,
+      options.maliciousTrigger ?? "malicious.llm_malicious",
+    );
+    return;
+  }
+
+  if (pkg.latestReleaseId !== release._id) return;
 
   const nextVerification = pkg.verification
     ? {
@@ -6619,7 +6967,11 @@ export const updateReleaseLlmAnalysisInternal = internalMutation({
       ...release,
       llmAnalysis: args.llmAnalysis,
     } as Doc<"packageReleases">;
-    await syncLatestPackageVerification(ctx, updatedRelease);
+    const llmVerdict = (args.llmAnalysis.verdict ?? args.llmAnalysis.status).trim().toLowerCase();
+    await syncLatestPackageVerification(ctx, updatedRelease, {
+      quarantineMaliciousLatest: llmVerdict === "malicious",
+      maliciousTrigger: "malicious.llm_malicious",
+    });
   },
 });
 
